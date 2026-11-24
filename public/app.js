@@ -259,8 +259,6 @@ async function chooseOption(questionId, letter) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session_id: currentSession.session_id,
-        recovery_token: currentSession.recovery_token,
         question_id: questionId,
         answer: letter,
       }),
@@ -347,8 +345,11 @@ async function submitTestNow() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session_id: currentSession.session_id,
-        recovery_token: currentSession.recovery_token,
+        session_id: currentSession?.session_id,
+        recovery_token: currentSession?.recovery_token,
+        answers: answers,
+        student_name: currentSession?.student_name,
+        started_at: currentSession?.started_at,
       }),
     });
 

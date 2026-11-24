@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const crypto = require('crypto');
-const db = require('./database');
 const { QUESTIONS, calculateLevel, getClientQuestions, TEST_DURATION_SECONDS } = require('./questions');
 
 const app = express();
@@ -28,7 +27,7 @@ app.post('/api/test/validate-id', (req, res) => {
 
 // 2. Start Test
 app.post('/api/test/start', (req, res) => {
-  const { full_name, test_id_code, telegram_id } = req.body;
+  const { full_name, test_id_code } = req.body;
   if (!full_name || !full_name.trim()) {
     return res.status(400).json({ success: false, error: 'Ism va familiyangizni kiriting' });
   }
@@ -37,38 +36,24 @@ app.post('/api/test/start', (req, res) => {
   }
 
   const studentName = full_name.trim();
-  const studentId = crypto.randomUUID();
   const sessionId = crypto.randomUUID();
-  const recoveryToken = crypto.randomUUID();
   const startedAt = new Date();
   const expiresAt = new Date(startedAt.getTime() + (TEST_DURATION_SECONDS || 3600) * 1000);
-
-  db.createStudent(studentId, studentName, telegram_id);
-  db.createSession(sessionId, studentId, 'ADMIN24', startedAt.toISOString(), expiresAt.toISOString(), recoveryToken);
 
   res.json({
     success: true,
     data: {
       session_id: sessionId,
-      recovery_token: recoveryToken,
+      recovery_token: sessionId,
+      started_at: startedAt.toISOString(),
       expires_at: expiresAt.toISOString(),
       student_name: studentName,
     },
   });
 });
 
-// 3. Get Questions
+// 3. Get Questions (sanitized without correct answers)
 app.get('/api/test/questions', (req, res) => {
-  const { session_id, recovery_token } = req.query;
-  if (!session_id || !recovery_token) {
-    return res.status(401).json({ success: false, error: 'Ruxsat berilmadi' });
-  }
-
-  const session = db.getSession(String(session_id));
-  if (!session || session.recovery_token !== recovery_token) {
-    return res.status(401).json({ success: false, error: 'Sessiya topilmadi' });
-  }
-
   const clientQuestions = getClientQuestions();
   res.json({
     success: true,
@@ -77,55 +62,16 @@ app.get('/api/test/questions', (req, res) => {
   });
 });
 
-// 4. Save Answer
+// 4. Save Answer (Stateless acknowledge)
 app.post('/api/test/save-answer', (req, res) => {
-  const { session_id, recovery_token, question_id, answer } = req.body;
-  if (!session_id || !recovery_token) {
-    return res.status(401).json({ success: false, error: 'Ruxsat berilmadi' });
-  }
-
-  const session = db.getSession(String(session_id));
-  if (!session || session.recovery_token !== recovery_token) {
-    return res.status(401).json({ success: false, error: 'Sessiya topilmadi' });
-  }
-
-  let answers = {};
-  try {
-    answers = JSON.parse(session.answers || '{}');
-  } catch {}
-
-  answers[String(question_id)] = String(answer).toLowerCase();
-  db.saveAnswer(session.id, JSON.stringify(answers));
-
   res.json({ success: true });
 });
 
-// 5. Submit Test
+// 5. Submit Test (Calculates score & level in-memory from submitted answers)
 app.post('/api/test/submit', (req, res) => {
-  const { session_id, recovery_token } = req.body;
-  if (!session_id || !recovery_token) {
-    return res.status(401).json({ success: false, error: 'Ruxsat berilmadi' });
-  }
+  const { answers = {}, student_name, started_at } = req.body;
 
-  const session = db.getSession(String(session_id));
-  if (!session || session.recovery_token !== recovery_token) {
-    return res.status(401).json({ success: false, error: 'Sessiya topilmadi' });
-  }
-
-  // Check if already completed
-  const existing = db.getResultBySession(session.id);
-  if (existing) {
-    return res.json({ success: true, data: existing });
-  }
-
-  const student = db.getStudent(session.student_id);
-  const studentName = student ? student.full_name : 'Student';
-
-  let answers = {};
-  try {
-    answers = JSON.parse(session.answers || '{}');
-  } catch {}
-
+  const studentName = student_name ? String(student_name).trim() : 'Student';
   let correct = 0;
   let incorrect = 0;
   let unanswered = 0;
@@ -134,7 +80,7 @@ app.post('/api/test/submit', (req, res) => {
     const given = answers[String(q.id)];
     if (!given) {
       unanswered++;
-    } else if (given.toLowerCase() === q.correct_answer.toLowerCase()) {
+    } else if (String(given).toLowerCase() === String(q.correct_answer).toLowerCase()) {
       correct++;
     } else {
       incorrect++;
@@ -144,14 +90,12 @@ app.post('/api/test/submit', (req, res) => {
   const score = correct;
   const level = calculateLevel(score);
   const completedAt = new Date().toISOString();
-  const startedAt = new Date(session.started_at);
-  const durationSeconds = Math.max(0, Math.floor((new Date().getTime() - startedAt.getTime()) / 1000));
+  const startTime = started_at ? new Date(started_at).getTime() : Date.now();
+  const durationSeconds = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
   const resultId = crypto.randomUUID();
 
   const resultObj = {
     id: resultId,
-    session_id: session.id,
-    student_id: session.student_id,
     student_name: studentName,
     score,
     level,
@@ -162,19 +106,12 @@ app.post('/api/test/submit', (req, res) => {
     completed_at: completedAt,
   };
 
-  db.saveResult(resultObj);
-  db.completeSession(session.id, completedAt);
-
   res.json({ success: true, data: resultObj });
 });
 
-// 6. Get Result
+// 6. Get Result (Echo/Fallback)
 app.get('/api/test/result/:id', (req, res) => {
-  const result = db.getResult(req.params.id);
-  if (!result) {
-    return res.status(404).json({ success: false, error: 'Natija topilmadi' });
-  }
-  res.json({ success: true, data: result });
+  res.json({ success: true });
 });
 
 // Fallback to index.html for SPA routing
@@ -182,10 +119,14 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`===============================================`);
-  console.log(`🚀 UNATION English Test (HTML/CSS/JS + SQLite)`);
-  console.log(`📍 Web sayt: http://localhost:${PORT}`);
-  console.log(`💾 SQLite DB: ${path.join(__dirname, 'data.sqlite')}`);
-  console.log(`===============================================`);
-});
+// Run server when started directly (e.g. node server.js or run-simple.bat)
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`===============================================`);
+    console.log(`🚀 UNATION English Test (Stateless JSON)`);
+    console.log(`📍 Web sayt: http://localhost:${PORT}`);
+    console.log(`===============================================`);
+  });
+}
+
+module.exports = app;
